@@ -1,0 +1,1 @@
+cmd_/home/cizuss/tema2so2/so2-assignments/2-uart/uart16550.ko := ld -r -m elf_i386 -T ./scripts/module-common.lds --build-id  -o /home/cizuss/tema2so2/so2-assignments/2-uart/uart16550.ko /home/cizuss/tema2so2/so2-assignments/2-uart/uart16550.o /home/cizuss/tema2so2/so2-assignments/2-uart/uart16550.mod.o ;  true
