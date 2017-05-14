@@ -1,17 +1,15 @@
 #include <linux/kernel.h>
-#include <linux/init.h>
 #include <linux/module.h>
-
-#include "uart16550.h"
-
-#include <asm/ioctl.h>
+#include <linux/init.h>
 #include <linux/interrupt.h>
-#include <linux/cdev.h>
-#include <asm/io.h>
-#include <linux/kfifo.h>
-#include <linux/uaccess.h>
 #include <linux/ioport.h>
 #include <linux/fs.h>
+#include <linux/sched.h>
+#include <linux/cdev.h>
+#include <linux/uaccess.h>
+#include <linux/kfifo.h>
+#include <asm/io.h>
+#include "uart16550.h"
 
 #define COM1_BASEPORT 0x3f8
 #define COM2_BASEPORT 0x2f8
@@ -29,8 +27,6 @@
 #define SET_BIT_0(var, pos) ((var) & ~(1<<(pos)))
 #define DEFAULT_MAJOR 42
 #define DEFAULT_OPTION OPTION_BOTH
-#define MINOR_COM1 0
-#define MINOR_COM2 1
 
 
 MODULE_LICENSE("GPL");
@@ -44,8 +40,6 @@ struct my_device_data {
 	DECLARE_KFIFO(write_kfifo, unsigned char, KFIFO_SIZE);
 	wait_queue_head_t read_wq;
 	wait_queue_head_t write_wq;
-	atomic_t read_kfifo_ready;
-	atomic_t write_kfifo_ready;
 };
 
 struct my_device_data devs[MAX_NUMBER_DEVICES];
@@ -73,14 +67,12 @@ static int my_read(struct file *file, char __user *user_buffer, size_t size,
 	dev = (struct my_device_data *) file->private_data;
 
 	outb(SET_BIT_1(inb(dev->baseport + IER), 0), dev->baseport + IER);
-	wait_event_interruptible(dev->read_wq, atomic_cmpxchg
-		(&dev->read_kfifo_ready, 0, 0) == 1);
+	wait_event(dev->read_wq, !kfifo_is_empty(&dev->read_kfifo));
 
 	err = kfifo_to_user(&dev->read_kfifo, user_buffer, size, &len);
 	if (err == -EFAULT)
 		return 0;
 
-	atomic_set(&dev->read_kfifo_ready, 0);
 	return len;
 }
 
@@ -93,15 +85,13 @@ static int my_write(struct file *file, const char __user *user_buffer,
 
 	dev = (struct my_device_data *) file->private_data;
 
+	wait_event(dev->write_wq, !kfifo_is_full(&dev->write_kfifo));
+
 	err = kfifo_from_user(&dev->write_kfifo, user_buffer, size, &len);
 	if (err == -EFAULT)
-		return -EFAULT;
+		return 0;
 
-	atomic_set(&dev->write_kfifo_ready, 1);
 	outb(SET_BIT_1(inb(dev->baseport + IER), 1), dev->baseport + IER);
-	wait_event_interruptible(dev->write_wq,
-		atomic_cmpxchg(&dev->write_kfifo_ready, 1, 1) == 0);
-
 	return len;
 }
 
@@ -150,13 +140,12 @@ irqreturn_t uart_handler(int irq_no, void *dev_id)
 		lsr_data = inb(dev->baseport + LSR);
 
 		if (!(CHECK_BIT(lsr_data, 0)) ||
-		atomic_read(&dev->read_kfifo_ready) == 1)
+		kfifo_is_full(&dev->read_kfifo))
 			break;
 		data = inb(dev->baseport);
 		kfifo_in(&dev->read_kfifo, &data, 1);
 	}
 
-	atomic_set(&dev->read_kfifo_ready, 1);
 	wake_up(&dev->read_wq);
 	outb(SET_BIT_0(inb(dev->baseport + IER), 0), dev->baseport + IER);
 
@@ -165,14 +154,13 @@ irqreturn_t uart_handler(int irq_no, void *dev_id)
 		while (true) {
 			lsr_data = inb(dev->baseport + LSR);
 			if (!(CHECK_BIT(lsr_data, 5)) ||
-			atomic_read(&dev->write_kfifo_ready) == 0)
+			kfifo_is_empty(&dev->write_kfifo))
 				break;
 			res = kfifo_out(&dev->write_kfifo, &data, 1);
 			if (!res)
 				break;
 			outb(data, dev->baseport);
 		}
-		atomic_set(&dev->write_kfifo_ready, 0);
 		wake_up(&dev->write_wq);
 		outb(SET_BIT_0(inb(dev->baseport + IER), 1),
 		dev->baseport + IER);
@@ -191,47 +179,44 @@ const struct file_operations my_fops = {
 	.unlocked_ioctl = my_ioctl
 };
 
-static int register_port(struct my_device_data *device)
+static int register_port(int minor)
 {
 	int err;
 
-	err = register_chrdev_region(MKDEV(major, device->minor), 1,
+	err = register_chrdev_region(MKDEV(major, devs[minor].minor), 1,
 	"uart16550");
 	if (err != 0)
 		return err;
 
-	cdev_init(&device->dev, &my_fops);
-	cdev_add(&device->dev, MKDEV(major, device->minor), 1);
+	cdev_init(&devs[minor].dev, &my_fops);
+	cdev_add(&devs[minor].dev, MKDEV(major, devs[minor].minor), 1);
 
-	if (!request_region(device->baseport, NR_PORTS, "uart16550"))
+	if (!request_region(devs[minor].baseport, NR_PORTS, "uart16550"))
 		return -ENODEV;
 
-	err = request_irq(device->irq_no, uart_handler, IRQF_SHARED,
-	"uart16550", device);
+	err = request_irq(devs[minor].irq_no, uart_handler, IRQF_SHARED,
+	"uart16550", &devs[minor]);
 
 	if (err < 0)
 		return err;
 
-	outb(0x01, device->baseport + FCR);
+	outb(0x01, devs[minor].baseport + FCR);
 
-	INIT_KFIFO(device->read_kfifo);
-	INIT_KFIFO(device->write_kfifo);
+	INIT_KFIFO(devs[minor].read_kfifo);
+	INIT_KFIFO(devs[minor].write_kfifo);
 
-	init_waitqueue_head(&device->read_wq);
-	init_waitqueue_head(&device->write_wq);
-
-	atomic_set(&device->read_kfifo_ready, 0);
-	atomic_set(&device->write_kfifo_ready, 0);
+	init_waitqueue_head(&devs[minor].read_wq);
+	init_waitqueue_head(&devs[minor].write_wq);
 
 	return 0;
 }
 
-static int release_port(struct my_device_data *device)
+static int release_port(int minor)
 {
-	free_irq(device->irq_no, device);
-	release_region(device->baseport, NR_PORTS);
-	cdev_del(&device->dev);
-	unregister_chrdev_region(MKDEV(major, device->minor), 1);
+	free_irq(devs[minor].irq_no, &devs[minor]);
+	release_region(devs[minor].baseport, NR_PORTS);
+	cdev_del(&devs[minor].dev);
+	unregister_chrdev_region(MKDEV(major, minor), 1);
 	return 0;
 }
 
@@ -250,14 +235,14 @@ static int initialize_devices(void)
 {
 	switch (option) {
 	case OPTION_COM1:
-		register_port(&devs[MINOR_COM1]);
+		register_port(devs[MINOR_COM1]);
 		break;
 	case OPTION_COM2:
-		register_port(&devs[MINOR_COM2]);
+		register_port(devs[MINOR_COM2]);
 		break;
 	case OPTION_BOTH:
-		register_port(&devs[MINOR_COM1]);
-		register_port(&devs[MINOR_COM2]);
+		register_port(devs[MINOR_COM1]);
+		register_port(devs[MINOR_COM2]);
 		break;
 	default:
 		return -1;
@@ -269,26 +254,49 @@ static void release_devices(void)
 {
 	switch (option) {
 	case OPTION_COM1:
-		release_port(&devs[MINOR_COM1]);
+		release_port(devs[MINOR_COM1]);
 		break;
 	case OPTION_COM2:
-		release_port(&devs[MINOR_COM2]);
+		release_port(devs[MINOR_COM2]);
 		break;
 	default:
-		release_port(&devs[MINOR_COM1]);
-		release_port(&devs[MINOR_COM2]);
+		release_port(devs[MINOR_COM1]);
+		release_port(devs[MINOR_COM2]);
 	}
 }
 
 static int uart16550_init(void)
 {
-	declare_devices();
-	return initialize_devices();
+	switch (option) {
+	case OPTION_COM1:
+		register_port(0);
+		break;
+	case OPTION_COM2:
+		register_port(1);
+		break;
+	case OPTION_BOTH:
+		register_port(0);
+		register_port(1);
+		break;
+	default:
+		return -1;
+	}
+	return 0;
 }
 
 static void uart16550_exit(void)
 {
-	release_devices();
+	switch (option) {
+	case OPTION_COM1:
+		release_port(0);
+		break;
+	case OPTION_COM2:
+		release_port(1);
+		break;
+	default:
+		release_port(0);
+		release_port(1);
+	}
 }
 
 module_init(uart16550_init);

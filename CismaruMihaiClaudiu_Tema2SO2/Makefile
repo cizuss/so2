@@ -1,4 +1,4 @@
-KDIR = /home/cizuss/linux-4.9.11
+KDIR = /usr/src/linux-so2
 
 kbuild:
 	make -C $(KDIR) M=`pwd`
